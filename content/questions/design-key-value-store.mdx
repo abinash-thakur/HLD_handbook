@@ -1,0 +1,129 @@
+---
+title: "Design a Key-Value Store"
+slug: "design-key-value-store"
+type: "case-study"
+category: "System Design Case Studies"
+tags: ["databases", "distributed-systems", "hashing", "consistency"]
+difficulty: "advanced"
+estimatedTime: "45-60 min"
+summary: "Design a distributed key-value database like DynamoDB — consistent hashing, quorum replication, vector clocks, and gossip."
+relatedConcepts: ["consistent-hashing", "database-replication", "vector-clocks", "gossip-protocol"]
+relatedQuestions: ["design-distributed-cache", "eventual-consistency-explained"]
+diagramType: "mermaid"
+order: 16
+lastUpdated: "2026-07-18"
+draft: false
+---
+
+## Problem Statement
+
+Design a distributed key-value database — a giant dictionary spread across many servers. Store data with `put(key, value)`, retrieve it with `get(key)`. Think of a locker room: each locker has a number (the key), and your belongings (the value) are inside.
+
+**Real-world example:** Amazon's "Add to Cart" — your user ID is the key, your cart is the value. Billions of users; must be fast, reliable, and always available.
+
+## Clarifying Questions
+
+- What scale — total data size and requests/second?
+- Consistency vs availability: is a slightly stale read acceptable? (Usually yes — that's the point of these systems.)
+- Value size limits? Single-key operations only, or scans too?
+
+## Requirements
+
+- **Scalability** — millions of users without slowing down; add servers to grow.
+- **Decentralization** — no single server whose crash breaks everything.
+- **Eventual consistency** — all servers agree on the data *eventually*, even after network problems.
+
+## High-Level Design
+
+Four building blocks, layered in order:
+
+1. **Partitioning** — split data across servers with [consistent hashing](/concepts/consistent-hashing)
+2. **Replication** — copy each key to N servers for fault tolerance
+3. **Get/Put with quorums** — the R + W > N rule
+4. **Versioning** — vector clocks to detect and resolve conflicts
+
+### Step 1 — Partitioning with consistent hashing
+
+Naive `hash(key) % n` remaps almost every key whenever a server is added. Instead, servers and keys live on a **hash ring**: each key belongs to the first server clockwise from its position. Adding or removing a server only moves the keys in one small arc, and **virtual nodes** (each server at many ring positions) keep the load even.
+
+### Step 2 — Replication: coordinator and preference list
+
+The server that owns a key's hash range is its **coordinator**. It stores the primary copy, then walks clockwise to find N−1 more servers and copies the data to them **asynchronously** (fast writes — the client isn't kept waiting for all replicas).
+
+The coordinator maintains a **preference list** — the ordered list of servers holding this key:
+
+| Position | Server |
+| --- | --- |
+| Primary | S1 — the coordinator |
+| Replica 1 | S2 — first server clockwise |
+| Replica 2 | S3 — second server clockwise |
+
+```mermaid
+graph LR
+  C[Client] -->|"put(key)"| S1["S1 — Coordinator<br/>stores primary copy"]
+  S1 -.->|async replicate| S2["S2 — replica"]
+  S1 -.->|async replicate| S3["S3 — replica"]
+```
+
+### Step 3 — Quorums: the golden rule R + W > N
+
+- **N** = total replicas (e.g. 3)
+- **W** = confirmations required before a write is "successful"
+- **R** = replies required before a read returns
+
+With N=3, W=2, R=2: R + W = 4 > 3, so **any read quorum overlaps any write quorum** — a read always reaches at least one server with the latest write.
+
+```mermaid
+graph TD
+  subgraph Why ["Why R + W > N guarantees overlap (N=3, W=2, R=2)"]
+    S1["S1<br/>✍ wrote"] --- S2["S2<br/>✍ wrote · 👁 read"] --- S3["S3<br/>👁 read"]
+  end
+  N["Write touched {S1,S2} · Read asked {S2,S3}<br/>→ S2 is in BOTH — the read cannot miss the latest write ✓"]
+  Why --- N
+```
+
+**Put** (`put("CAR")`, W=2): coordinator stores it, replicates to S2/S3 in the background, and confirms success as soon as **2 of 3** servers acknowledge — S3 may still be catching up.
+
+**Get** (R=2): the coordinator asks **all** replicas, returns once R=2 have answered. Why ask all? Because replicas can disagree (crashes, network delays) — collecting versions lets the system compare vector clocks and spot conflicts.
+
+## Deep Dive: Conflicts and Vector Clocks
+
+A **vector clock** is a tag on each value recording who updated it: `[S1,1]` = "S1 made update #1."
+
+Failure story (N=3):
+
+1. All replicas hold `CAR [S1,1]` — synced.
+2. S1 goes down. A `put("CART")` is handled by S2 → `CART [S1,1][S2,1]`.
+3. S2 is busy. A `put("CARM")` lands on S3 → `CARM [S1,1][S3,1]`.
+
+When everyone recovers, a read finds both `[S1,1][S2,1]` and `[S1,1][S3,1]`: same ancestor `[S1,1]`, but **neither contains the other** — the writes happened in parallel. This is a genuine conflict the system can't auto-resolve.
+
+**Resolution:** return *both* versions to the client application, which picks or merges (e.g. keeps `CARM`), then writes back with the merged clock `[S1,1][S2,1][S3,1]`. All replicas converge — this is [eventual consistency](/questions/eventual-consistency-explained) in action, and exactly how Amazon's cart merges work.
+
+## Deep Dive: Failure Detection — Gossip Protocol
+
+With 100 servers, everyone pinging everyone is 10,000 checks/second — and a central monitor would be a single point of failure. Instead, servers **gossip**:
+
+- Every second, each server sends a heartbeat + its membership list to a few *random* peers.
+- Receivers merge the lists; news spreads across the whole cluster in seconds — like office gossip.
+- Missed heartbeats → mark the server suspicious → after a timeout, DOWN; its ring range shifts to the next server clockwise and traffic reroutes to replicas.
+
+```mermaid
+graph LR
+  S1((S1)) <-->|heartbeat + list| S2((S2))
+  S2 <--> S4((S4))
+  S1 <--> S3((S3 ✗ down))
+  S2 -->|"'S3 is down' spreads"| S5((S5))
+```
+
+## Trade-offs & Alternatives
+
+- **Tuning the quorum dial:** W=N, R=1 → strong writes, fast reads, fragile writes during failures. W=1, R=1 → fastest but weakest guarantees. R+W>N is the balanced default.
+- **Vector clocks vs last-write-wins:** LWW (Cassandra's default) is simpler but silently drops one of two concurrent writes; vector clocks preserve both at the cost of client-side resolution.
+- **This is an AP design** ([CAP](/concepts/cap-theorem)): availability first. For CP semantics you'd use a consensus system (etcd, ZooKeeper) instead.
+
+## Follow-Up Questions
+
+- How does a new server bootstrap its data? (Streams the ring range it now owns from its predecessor.)
+- What if a replica was down during a write? (Hinted handoff — a neighbor holds the write and delivers it when the replica returns; read repair fixes stale replicas during gets.)
+- Why read from all replicas but wait for only R? (Latency: respond at the R-th reply; completeness: still collect stragglers for conflict detection/repair.)

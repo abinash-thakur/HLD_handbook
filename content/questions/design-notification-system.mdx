@@ -1,0 +1,90 @@
+---
+title: "Design a Notification System"
+slug: "design-notification-system"
+type: "case-study"
+category: "System Design Case Studies"
+tags: ["messaging", "scalability", "reliability"]
+difficulty: "intermediate"
+estimatedTime: "30-40 min"
+summary: "Design a service that sends push, email, and SMS notifications at scale — queues, retries, dedup, and user preferences."
+relatedConcepts: ["message-queues", "idempotency", "rate-limiting"]
+relatedQuestions: ["design-chat-app", "design-ecommerce-order-system"]
+diagramType: "mermaid"
+order: 11
+lastUpdated: "2026-07-18"
+draft: false
+---
+
+## Problem Statement
+
+Design the platform service every product team uses to reach users: push notifications, email, and SMS — triggered by events ("order shipped", "new message", "price drop"), respecting user preferences, at millions of notifications per hour.
+
+## Clarifying Questions
+
+- Which channels? (Push + email + SMS.)
+- Real-time triggers only, or also scheduled/bulk campaigns?
+- Strictness: is a rare duplicate acceptable? A rare miss? (Duplicates annoying but survivable; losses bad for critical notices — prioritize at-least-once + dedup.)
+- Scale? (Say 10 M notifications/hour, spiky.)
+
+## Requirements
+
+**Functional:** other services submit notification requests; per-user channel preferences and opt-outs; templates; delivery status tracking.
+**Non-functional:** high throughput with burst absorption; at-least-once delivery with dedup; critical notices (OTP!) prioritized over marketing.
+
+## High-Level Design
+
+The backbone is a [message queue](/concepts/message-queues) — notification sending is naturally asynchronous and bursty:
+
+```mermaid
+graph LR
+  P["Producer services<br/>(orders, chat, marketing)"] --> API["Notification API<br/>validate + dedup + prefs"]
+  API --> Q[["Queues<br/>(per channel & priority)"]]
+  Q --> W1["Push workers"] --> APNS["APNs / FCM"]
+  Q --> W2["Email workers"] --> SES["Email provider"]
+  Q --> W3["SMS workers"] --> TW["SMS provider"]
+  W1 & W2 & W3 --> DS[("Delivery status store")]
+```
+
+1. **Notification API** — accepts `{user, event type, payload, idempotency key}`; checks preferences/opt-outs; resolves template; enqueues one message per chosen channel.
+2. **Queues** — separated **per channel** (different throughput/failure profiles) and **per priority** (OTP lane never queues behind a 5 M-user campaign).
+3. **Workers** — pull, render, call the third-party provider (APNs/FCM, email, SMS), record status, retry on failure.
+
+## Deep Dive
+
+### Not losing, not duplicating
+
+```mermaid
+graph LR
+  Q[["Queue"]] --> W["Worker picks up job"]
+  W --> D{"1. Already sent?<br/>(idempotency key in Redis)"}
+  D -->|"yes → skip ✓"| END["done"]
+  D -->|no| SEND["2. Send via provider"]
+  SEND -->|"success → mark key sent"| END
+  SEND -.->|"failure"| RETRY["3. Retry with backoff<br/>1s → 2s → 4s → 8s"]
+  RETRY -.->|"still failing after N tries"| DLQ[["Dead-letter queue<br/>for humans to inspect"]]
+```
+
+- Queue + acks give **at-least-once** — a worker dying mid-send causes redelivery.
+- Redelivery means possible duplicates → **dedup with an [idempotency key](/concepts/idempotency)** (`event id + user + channel`) checked in Redis before sending.
+- Repeatedly failing messages → **dead-letter queue** for inspection, not infinite retries.
+- Retries use **exponential backoff** — hammering a struggling provider makes it worse.
+
+### Third-party providers fail
+
+Providers are outside your control: per-provider [rate limits](/concepts/rate-limiting), circuit breakers, and a fallback provider for critical SMS/email. Provider callbacks (bounces, delivery receipts) update the status store.
+
+### User preferences & throttling
+
+Check at send time, not enqueue time (preferences may change in between). Add per-user frequency caps ("max 3 marketing pushes/day") and quiet hours — the *product* side of rate limiting.
+
+## Trade-offs & Alternatives
+
+- **One queue vs many:** many queues (channel × priority) isolate failures and let you scale workers independently — worth the operational overhead at this scale.
+- **At-least-once + dedup** vs at-most-once: duplicates are recoverable, silent losses aren't. For OTPs, users retry anyway.
+- **Batch API calls** to providers (FCM batch) trade latency for throughput on campaigns.
+
+## Follow-Up Questions
+
+- A campaign to 5 M users just got enqueued — how do OTPs stay fast? (Priority queues + reserved worker capacity.)
+- How do you know a push was actually delivered? (You often don't — track provider accept + app-open receipts; treat delivery as probabilistic.)
+- Scheduled notifications? (A scheduler service moves due jobs onto the queues — don't sleep in workers.)

@@ -1,0 +1,77 @@
+---
+title: "CDN (Content Delivery Network)"
+slug: "cdn"
+category: "Networking"
+tags: ["networking", "caching", "performance"]
+difficulty: "beginner"
+oneLiner: "A CDN is a network of servers around the world that serves your static content from a location near each user."
+summary: "How edge servers cut latency for static content, push vs pull CDNs, and cache invalidation at the edge."
+diagramType: "mermaid"
+relatedConcepts: ["caching", "load-balancing", "proxy-vs-reverse-proxy"]
+relatedQuestions: ["design-video-streaming"]
+order: 6
+lastUpdated: "2026-07-18"
+draft: false
+---
+
+Every request to a server on another continent pays for the distance — light in fiber takes ~70 ms to cross the Atlantic and back. A CDN fixes this by keeping **copies of your content on servers physically near your users** ("edge servers").
+
+## Analogy
+
+A newspaper isn't printed in one city and mailed worldwide — it's printed in dozens of local printing plants from the same master copy, so every reader gets it fresh in the morning. The journalists (your origin server) write once; the plants (edge servers) distribute everywhere.
+
+## How It Works
+
+```mermaid
+graph LR
+  U1["User in Delhi"] --> E1["Edge server<br/>Mumbai"]
+  U2["User in Paris"] --> E2["Edge server<br/>Frankfurt"]
+  E1 -.->|"cache miss only"| O["Origin server<br/>(your infrastructure)"]
+  E2 -.->|"cache miss only"| O
+```
+
+1. A user requests `logo.png`. DNS routes them to the **nearest edge server**.
+2. If the edge has it cached → served immediately (a hit — the common case).
+3. If not → the edge fetches it from your **origin**, caches it, then serves it. The next thousand users in that region hit the cache.
+
+## Deep Dive
+
+### What belongs on a CDN
+
+Static content is the classic case: images, video, CSS/JS bundles, fonts, downloads. Modern CDNs also cache API responses and full HTML pages, and run code at the edge (Cloudflare Workers, Lambda@Edge).
+
+### Pull vs push
+
+```mermaid
+graph TD
+  subgraph Pull ["Pull CDN (lazy)"]
+    P1["1. First user requests file"] --> P2["2. Edge has nothing → fetches from origin"] --> P3["3. Edge caches it → everyone after is fast"]
+  end
+  subgraph Push ["Push CDN (ahead of time)"]
+    Q1["1. You upload files to the CDN first"] --> Q2["2. Edges already have everything"] --> Q3["3. Even the first user is fast"]
+  end
+```
+
+- **Pull CDN** — edges fetch from origin on the first miss (lazy). Zero upkeep; the first user in a region pays the slow fetch.
+- **Push CDN** — you upload content to the CDN ahead of time. Predictable, good for big planned releases (game updates, video launches).
+
+### Invalidation and versioning
+
+The stale-cache problem from [caching](/concepts/caching) applies at the edge too. The standard trick is **versioned file names** (`app.3f9c2.js`): a new deploy references new names, so nothing stale is ever served and old files can cache forever.
+
+### Beyond speed
+
+- **Origin offload** — 90 %+ of traffic never reaches your servers.
+- **DDoS absorption** — attack traffic hits the CDN's massive capacity first.
+- **TLS termination** near users speeds up connection setup.
+
+## Real-World Examples
+
+- Cloudflare, Akamai, AWS CloudFront, Fastly.
+- Netflix runs its own CDN (Open Connect) with servers *inside* ISP data centers — see [Design Video Streaming](/questions/design-video-streaming).
+
+## Interview Follow-Ups
+
+- What can't a CDN cache? (Truly per-user, real-time, or write-path data.)
+- How do you force an urgent content update? (Purge API + short TTLs, or versioned URLs.)
+- CDN vs your own cache — when do you need both? (CDN for static/global, Redis for dynamic/per-user.)
