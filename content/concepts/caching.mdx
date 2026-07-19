@@ -107,9 +107,11 @@ Writes go **directly to the database and skip the cache**.
 
 ```mermaid
 graph LR
-  W["Write request"] -->|"1. write straight to DB"| DB[("Database")]
-  W -.->|"2. mark cache entry invalid"| C["Cache<br/>(old value = stale ✗)"]
-  R["Next read"] -.->|"3. miss → fetch fresh from DB"| DB
+  W["Write request"] -->|"1. write straight to DB<br/>(cache is skipped)"| DB[("Database")]
+  W -.->|"2. mark old cache<br/>entry invalid ✗"| C["Cache"]
+  R["Next read"] -->|"3. check cache first"| C
+  C -.->|"4. MISS<br/>(entry was invalidated)"| DB
+  DB -->|"5. fresh data stored in cache<br/>and returned to reader"| C
 ```
 
 **How it works:** a write request goes straight to the database, and the matching cache entry is **marked invalid** (stale) so nobody reads the old value. On the next read there's a cache miss, so fresh data is fetched from the database and stored in the cache.
