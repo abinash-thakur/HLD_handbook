@@ -44,11 +44,36 @@ Four building blocks, layered in order:
 
 ### Step 1 — Partitioning with consistent hashing
 
-Naive `hash(key) % n` remaps almost every key whenever a server is added. Instead, servers and keys live on a **hash ring**: each key belongs to the first server clockwise from its position. Adding or removing a server only moves the keys in one small arc, and **virtual nodes** (each server at many ring positions) keep the load even.
+Why can't one server hold everything? A single server storing all key-value pairs would:
+
+- **Run out of memory** quickly with millions of entries.
+- **Become a bottleneck** — too slow with millions of simultaneous requests.
+- **Cause a total outage** if that one server crashes.
+
+So we split the data — and the splitting technique matters. Naive `hash(key) % n` remaps almost every key whenever a server is added. Instead, servers and keys live on a **hash ring** ([consistent hashing](/concepts/consistent-hashing)): each key belongs to the first server clockwise from its position. Adding or removing a server only moves the keys in one small arc, and **virtual nodes** (each server at many ring positions) keep the load even.
+
+A concrete example — servers at ring positions 20 (S1), 50 (S2), 80 (S3):
+
+```
+hash(user123) = 45  →  first server clockwise after 45 is S2 (at position 50)
+```
+
+So `user123`'s data lives on S2. Add S4 at position 60 and only the keys between 50 and 60 move to it; everything else stays put.
 
 ### Step 2 — Replication: coordinator and preference list
 
-The server that owns a key's hash range is its **coordinator**. It stores the primary copy, then walks clockwise to find N−1 more servers and copies the data to them **asynchronously** (fast writes — the client isn't kept waiting for all replicas).
+The server that owns a key's hash range is its **coordinator**. Its job, in order:
+
+1. Store the **primary copy** of the data.
+2. Walk clockwise on the ring to find **N − 1 additional servers**.
+3. Send copies of the data to those replica servers.
+4. Manage the **preference list** for this key.
+
+Replication happens **asynchronously** — the coordinator does not wait for all replicas before confirming to the client. That gives:
+
+- **Fast write responses** — the client isn't kept waiting for all copies.
+- **Better throughput** — multiple writes happen in parallel.
+- **High scalability** — replicas catch up in the background without blocking the main flow.
 
 The coordinator maintains a **preference list** — the ordered list of servers holding this key:
 
@@ -84,7 +109,17 @@ graph TD
 
 **Put** (`put("CAR")`, W=2): coordinator stores it, replicates to S2/S3 in the background, and confirms success as soon as **2 of 3** servers acknowledge — S3 may still be catching up.
 
-**Get** (R=2): the coordinator asks **all** replicas, returns once R=2 have answered. Why ask all? Because replicas can disagree (crashes, network delays) — collecting versions lets the system compare vector clocks and spot conflicts.
+**Get** (`get("CAR")`, R=2), step by step:
+
+| Step | What happens |
+| --- | --- |
+| 1 | `hash("CAR") = 45` → S1 is the coordinator |
+| 2 | S1 contacts **all** servers in the preference list: S1, S2, S3 |
+| 3 | Each server sends back its value **and version (vector clock)** |
+| 4 | As soon as **R = 2** servers respond → return the data to the client |
+| 5 | Fewer than R servers respond → **Read Failed ❌** |
+
+Why ask **all** replicas but wait for only R? Because replicas can disagree (crashes, network delays) — collecting every available version lets the system compare vector clocks, detect conflicts, and return the most up-to-date value (or flag the conflict for the client to resolve).
 
 ## Deep Dive: Conflicts and Vector Clocks
 
@@ -115,6 +150,30 @@ graph LR
   S1 <--> S3((S3 ✗ down))
   S2 -->|"'S3 is down' spreads"| S5((S5))
 ```
+
+## Summary — The Complete Picture
+
+How every concept fits together in a production key-value database like Amazon DynamoDB or Apache Cassandra:
+
+| Concept | What it does and why it matters |
+| --- | --- |
+| Partitioning | Splits data across many servers so no single machine is overwhelmed |
+| [Consistent hashing](/concepts/consistent-hashing) | Places servers and keys on a ring; only nearby keys move when servers change |
+| Virtual nodes (VNodes) | Each server appears multiple times on the ring for even load distribution |
+| Replication (N) | Stores N copies of every key across different servers for fault tolerance |
+| Coordinator | The primary server for a key — stores it and manages its replicas |
+| Preference list | Ordered list of servers (coordinator + replicas) holding a specific key |
+| Async replication | Copies spread to replicas in the background — keeps writes fast |
+| W (write quorum) | Minimum servers that must confirm before a write succeeds |
+| R (read quorum) | Minimum servers that must reply before a read returns |
+| **R + W > N** | The golden rule: guarantees every read sees the latest write |
+| [Vector clocks](/concepts/vector-clocks) | `[server, counter]` tags per update to detect and resolve conflicts |
+| [Eventual consistency](/questions/eventual-consistency-explained) | All replicas agree on the same data — not instantly, but reliably over time |
+| [Gossip protocol](/concepts/gossip-protocol) | Servers share heartbeats + membership lists every second to detect failures fast |
+
+<Callout type="tip">
+**The golden rule: R + W > N.** This one formula balances consistency, availability, and performance. Set W high for strong write guarantees; set R high for strong read guarantees. The trade-off is speed vs accuracy — and this rule lets you tune it precisely.
+</Callout>
 
 ## Trade-offs & Alternatives
 

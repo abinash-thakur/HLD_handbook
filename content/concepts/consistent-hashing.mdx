@@ -28,7 +28,23 @@ The obvious formula is:
 server = hash(key) % n     (n = number of servers)
 ```
 
-With `n = 4`: `hash(user123) % 4 = 2` → Server 2. But add one server (`n = 5`) and `hash(user123) % 5 = 4` → Server 4. **Almost every key in the system now maps to a different server.** Caches become useless, the network floods with data movement, and the system crawls — unacceptable at scale.
+| | |
+| --- | --- |
+| **Formula** | `server = hash(key) % n` |
+| **Example (n = 4)** | `hash(user123) % 4 = 2` → stored on Server 2 |
+| **After adding a server (n = 5)** | `hash(user123) % 5 = 4` → now maps to Server 4! |
+
+Adding just one server changes `n`, which remaps **almost every key** to a completely different server. Nearly all cached data becomes invalid at once, network traffic spikes as data moves everywhere, and the system slows to a crawl — unacceptable at scale.
+
+```mermaid
+graph TD
+  subgraph Normal ["Normal hashing: add ONE server…"]
+    N1["hash % n changes for<br/>almost EVERY key"] --> N2["😱 nearly all keys move<br/>caches invalid, network floods"]
+  end
+  subgraph Consistent ["Consistent hashing: add ONE server…"]
+    C1["only the keys in one small<br/>arc of the ring move"] --> C2["✓ everything else stays<br/>exactly where it was"]
+  end
+```
 
 ## How It Works
 
