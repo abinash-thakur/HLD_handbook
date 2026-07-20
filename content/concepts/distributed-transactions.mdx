@@ -1,0 +1,199 @@
+---
+title: "Distributed Transactions: 2PC, 3PC & Saga"
+slug: "distributed-transactions"
+category: "Distributed Systems"
+tags: ["distributed-systems", "transactions", "consistency", "microservices", "saga"]
+difficulty: "advanced"
+oneLiner: "When one business action spans several databases, these protocols decide whether they all commit together, all roll back together, or undo each other's work step by step."
+summary: "How to keep a transaction atomic across multiple services and databases using Two-Phase Commit, Three-Phase Commit, and the Saga pattern — with their failure modes and trade-offs."
+diagramType: "mermaid"
+relatedConcepts: ["idempotency", "message-queues", "database-replication", "cap-theorem", "concurrency-control"]
+relatedQuestions: ["eventual-consistency-explained", "design-ecommerce-order-system"]
+order: 15
+lastUpdated: "2026-07-20"
+draft: false
+---
+
+A **transaction** is a set of database operations that must happen together as a single unit of work: either all of them succeed, or none of them do. Inside a single database, the engine guarantees this for you. The hard problem starts when one business action — placing an order — has to update the Order service's database *and* the Inventory service's database, each owned by a different microservice. Now who guarantees they commit together or roll back together?
+
+## Analogy
+
+Two friends agree to buy concert tickets only if they can *both* go. Neither wants to pay unless the other does. So they appoint a third friend as the referee: "I'll ask each of you if you're ready. Only if you *both* say yes do I tell you both to pay. If even one of you backs out, nobody pays." That referee is a **transaction coordinator**, and the "ask first, decide after" dance is **Two-Phase Commit**.
+
+## The ACID Properties
+
+Every transaction should follow four properties, known together as **ACID**:
+
+| Property | Meaning |
+| --- | --- |
+| **Atomicity** | All operations succeed together or fail together. There is no "half-done" state. |
+| **Consistency** | The database is in a valid state before the transaction and after it. It never leaves data broken. |
+| **Isolation** | When many transactions run at once, the result looks as if they ran one after another (serially). |
+| **Durability** | Once committed, data is permanently saved — even if the database crashes right after. |
+
+<Callout type="info">
+Transactions do **not** actually run one after another — they run concurrently for performance. Isolation only guarantees the final result is the *same as if* they had run sequentially. This is called **serializability**.
+</Callout>
+
+Across a distributed system, no single engine owns all the data, so we need an explicit protocol. There are three common ones: **Two-Phase Commit (2PC)**, **Three-Phase Commit (3PC)**, and the **Saga pattern**.
+
+## Two-Phase Commit (2PC)
+
+As the name says, the protocol runs in two phases:
+
+- **Phase 1 — Voting / Prepare:** everyone is asked if they are ready to commit.
+- **Phase 2 — Decision / Commit:** based on the votes, a final decision (commit or rollback) is sent to everyone.
+
+### Who is involved
+
+- **Application** — initiates the transaction ("here is my set of operations, please do them").
+- **Transaction Coordinator** — the central component that manages the transaction and makes the final decision.
+- **Participant 1 (Order service)** — owns the order database.
+- **Participant 2 (Inventory service)** — owns the inventory database.
+
+### Happy path
+
+```mermaid
+sequenceDiagram
+  participant App as Application
+  participant C as Coordinator
+  participant P1 as Order (P1)
+  participant P2 as Inventory (P2)
+  App->>C: run these operations
+  C->>P1: do work (don't commit yet)
+  C->>P2: do work (don't commit yet)
+  Note over C,P2: Phase 1 — Prepare / Voting
+  C->>P1: PREPARE?
+  C->>P2: PREPARE?
+  P1-->>C: YES
+  P2-->>C: YES
+  Note over C,P2: Phase 2 — Decision (all YES → COMMIT)
+  C->>P1: COMMIT
+  C->>P2: COMMIT
+  P1-->>C: DONE
+  P2-->>C: DONE
+  C-->>App: success
+```
+
+If **every** participant votes YES, the coordinator sends **COMMIT** to all. If **even one** votes NO, it sends **ROLLBACK** to all. Participants apply the decision, reply DONE, and the coordinator returns the result.
+
+### The secret behind recovery: Write-Ahead Logs
+
+Before any failure scenario makes sense, one key idea: both the coordinator and the participants keep a **log file** (a *write-ahead log*, or WAL) on durable storage like disk, so it survives a crash.
+
+- The coordinator **writes every message to its log before sending it** — it logs "commit" *first*, then sends the COMMIT.
+- Each participant logs what it received and how it voted ("received prepare, voted YES") *before* replying.
+
+This rule — **write to the log first, send the message after** — is what lets both sides recover. After restarting, a node reads its log to learn exactly where the transaction was left.
+
+### Failure scenarios (classic interview questions)
+
+**Q1 — The PREPARE message is lost (or the coordinator dies before sending it).**
+Participants have executed and logged their work and are waiting for PREPARE. Since it never arrives, each participant hits a **timeout and aborts on its own**. Safe, because nothing was committed. If a late PREPARE arrives after the abort, the participant just replies NO and the whole transaction rolls back.
+
+**Q2 — A participant's YES vote is lost.**
+Say P1's YES arrives but P2's is lost (or P2 crashed before sending). The coordinator times out, sees it didn't get all votes, and sends **ROLLBACK** to everyone. When P2 recovers, its log shows an unfinished transaction; it asks the coordinator "what happened?", the coordinator replies "Aborted", and P2 rolls back too.
+
+**Q3 — The COMMIT message is lost.**
+Suppose the coordinator logs COMMIT, sends it to P1 and P2, but P3 is down. P1 and P2 commit. P3 is now **blocked** — it voted YES so it may not abort on its own, and it never got the decision so it can't commit either. It must wait. When P3 recovers, it asks the coordinator, which reads COMMIT from its log and tells P3 to commit. Everyone is consistent again.
+
+```mermaid
+graph TD
+  Q["Participant voted YES,<br/>coordinator then crashes"] --> B["No decision received<br/>→ cannot abort (voted YES)<br/>→ cannot commit (no decision)"]
+  B --> W["BLOCKED — holds locks,<br/>waits for coordinator to return"]
+  W --> R["Coordinator recovers,<br/>reads log, resends decision ✓"]
+```
+
+### The main problem with 2PC
+
+A participant that has voted YES **cannot decide on its own** — it fully depends on the coordinator. If the coordinator dies *after* the YES votes but *before* the decision, all participants are **blocked**, holding their locks, until it returns. This is why 2PC is a **blocking protocol**.
+
+<Callout type="warning">
+**Why isn't 2PC used much in microservices?** It is blocking; the coordinator is a **single point of failure**; it holds locks for a long time (bad for performance); and it does not scale well over unreliable networks.
+</Callout>
+
+## Three-Phase Commit (3PC)
+
+3PC attacks the blocking problem by inserting **one extra phase** in the middle:
+
+1. **Phase 1 — CanCommit (Voting):** same as 2PC. The coordinator asks "can you commit?" and each participant votes YES or NO.
+2. **Phase 2 — PreCommit:** if all votes are YES, the coordinator sends **PRE-COMMIT** — "everyone voted yes; get ready, the commit is coming." Each participant ACKs.
+3. **Phase 3 — DoCommit:** the coordinator sends the final **COMMIT**; participants commit and reply DONE.
+
+If any participant votes NO in Phase 1, or fails to ACK in Phase 2, the coordinator sends **ABORT** to everyone — just like the rollback path in 2PC.
+
+```mermaid
+sequenceDiagram
+  participant C as Coordinator
+  participant P as Participants
+  C->>P: CAN-COMMIT?
+  P-->>C: YES
+  Note over C,P: extra phase — everyone now knows all voted YES
+  C->>P: PRE-COMMIT
+  P-->>C: ACK
+  C->>P: DO-COMMIT
+  P-->>C: DONE
+```
+
+### Why the extra phase helps
+
+The PRE-COMMIT message carries one crucial fact: any participant that receives it now **knows every other participant voted YES**. That changes what a participant may do if the coordinator crashes:
+
+- In **2PC**, a YES-voter knows nothing about the other votes, so it must block.
+- In **3PC**, a participant that *received* PRE-COMMIT can, after a timeout, talk to the others and **safely commit on its own**. A participant that *didn't* receive it can **safely abort**, knowing the commit decision was never made.
+
+So 3PC is **non-blocking** in the absence of network partitions — participants are no longer completely stuck when the coordinator dies.
+
+### The trade-offs of 3PC
+
+- One **extra round of messages** per transaction, so it is slower than 2PC.
+- It can still behave **incorrectly during a network partition** — when the network splits into groups that can't talk, each group may reach a different decision.
+- Because of this cost and complexity, 3PC is **rarely used in production** — but it is a very common interview topic.
+
+## Saga Pattern
+
+Both 2PC and 3PC try to make a distributed transaction behave like one big atomic transaction, using locks and a coordinator. The **Saga pattern** takes a completely different approach — and it is the one most modern microservice systems actually use.
+
+### The core idea
+
+A Saga breaks one big distributed transaction into a **chain of small local transactions**, one per service. Each service commits its own local transaction **immediately** — no global locks, no waiting for others.
+
+If any step fails, the Saga runs **compensating transactions** — undo actions for the steps that already completed, executed **in reverse order**. If the order was created and payment charged, but reserving inventory fails, the Saga refunds the payment and cancels the order.
+
+```mermaid
+graph LR
+  A["Create Order ✓"] --> B["Charge Payment ✓"]
+  B --> C["Reserve Inventory ✗ fails"]
+  C -. compensate .-> D["Refund Payment"]
+  D -. compensate .-> E["Cancel Order"]
+```
+
+### Two ways to implement a Saga
+
+- **Choreography** — no central coordinator. Each service listens for events and reacts. The Order service publishes `OrderCreated`, the Payment service hears it and charges, then publishes `PaymentCompleted`, and so on. Simple for small flows, but hard to follow when many services are involved.
+- **Orchestration** — a central **Saga orchestrator** tells each service what to do next and triggers compensations on failure. Easier to understand and debug, but the orchestrator is one more component to build and maintain.
+
+<Callout type="warning">
+**The price: eventual consistency.** Because each service commits immediately, there are moments when the system is temporarily inconsistent — payment charged, stock not yet reserved. It becomes consistent *eventually*, once the whole Saga finishes (or all compensations run). See [eventual consistency](/questions/eventual-consistency-explained).
+</Callout>
+
+Compensations must be **idempotent** — a retried refund must not refund twice. See [idempotency](/concepts/idempotency).
+
+## Comparison
+
+| | 2PC | 3PC | Saga |
+| --- | --- | --- | --- |
+| Consistency | Strong | Strong | **Eventual** |
+| Blocking? | Yes (blocks on coordinator failure) | Non-blocking (no partition) | Never blocks |
+| Locks held | Long (until commit) | Long | Only per local step |
+| Coordinator SPOF | Yes | Reduced | Optional (orchestration) |
+| Scales over unreliable network | Poorly | Poorly | **Well** |
+| Used in modern microservices | Rarely | Almost never | **Commonly** |
+
+## Interview Follow-Ups
+
+- **Why is 2PC not used much in microservices?** Blocking, coordinator is a single point of failure, holds locks too long, scales poorly over unreliable networks.
+- **How does 3PC reduce blocking?** The PreCommit phase tells every participant that everyone voted YES, so survivors can decide among themselves if the coordinator crashes.
+- **Why is 3PC still rarely used?** An extra message round makes it slower, and it can still make inconsistent decisions under a network partition.
+- **2PC vs Saga in one line?** 2PC gives strong consistency but blocks and doesn't scale; Saga scales and never blocks, but only guarantees eventual consistency and requires a compensating action for every step.
+- **What makes recovery possible in 2PC/3PC?** The write-ahead log — write to the durable log *before* sending any message, so a crashed node can read its log and resume.
