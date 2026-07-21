@@ -77,6 +77,27 @@ sequenceDiagram
 
 If **every** participant votes YES, the coordinator sends **COMMIT** to all. If **even one** votes NO, it sends **ROLLBACK** to all. Participants apply the decision, reply DONE, and the coordinator returns the result.
 
+### Failure path — one participant votes NO
+
+```mermaid
+sequenceDiagram
+  participant App as Application
+  participant C as Coordinator
+  participant P1 as Order (P1)
+  participant P2 as Inventory (P2)
+  Note over C,P2: Phase 1 — Prepare / Voting
+  C->>P1: PREPARE?
+  C->>P2: PREPARE?
+  P1-->>C: YES
+  P2-->>C: NO (cannot commit)
+  Note over C,P2: Phase 2 — Decision (one NO → ABORT)
+  C->>P1: ROLLBACK
+  C->>P2: ROLLBACK
+  P1-->>C: ACK
+  P2-->>C: ACK
+  C-->>App: transaction failed
+```
+
 ### The secret behind recovery: Write-Ahead Logs
 
 Before any failure scenario makes sense, one key idea: both the coordinator and the participants keep a **log file** (a *write-ahead log*, or WAL) on durable storage like disk, so it survives a crash.
@@ -156,9 +177,14 @@ Both 2PC and 3PC try to make a distributed transaction behave like one big atomi
 
 ### The core idea
 
-A Saga breaks one big distributed transaction into a **chain of small local transactions**, one per service. Each service commits its own local transaction **immediately** — no global locks, no waiting for others.
+Think of a saga as a **relay race**, not a single sprint. A Saga breaks one big distributed transaction into a **sequence of small local transactions**, one per service. Each service:
 
-If any step fails, the Saga runs **compensating transactions** — undo actions for the steps that already completed, executed **in reverse order**. If the order was created and payment charged, but reserving inventory fails, the Saga refunds the payment and cancels the order.
+1. Updates its own database with a normal local ACID transaction, and
+2. Publishes an event (or sends a message) that tells the next step to run.
+
+There is no global lock and no waiting on everyone else — each local transaction commits **immediately**, for real, on its own. Nothing is "provisionally" held the way 2PC holds locks.
+
+If every step succeeds, the business operation is done. If one step fails (say, because a business rule is violated — the customer's credit limit is too low), the saga cannot just "roll back" like a normal database transaction, because the earlier steps have *already committed and are visible to other users*. Instead it runs **compensating transactions** — explicit undo actions for every step that already completed, executed **in reverse order**. If the order was created and payment charged, but reserving inventory fails, the saga refunds the payment and cancels the order.
 
 ```mermaid
 graph LR
@@ -170,14 +196,86 @@ graph LR
 
 ### Two ways to implement a Saga
 
-- **Choreography** — no central coordinator. Each service listens for events and reacts. The Order service publishes `OrderCreated`, the Payment service hears it and charges, then publishes `PaymentCompleted`, and so on. Simple for small flows, but hard to follow when many services are involved.
-- **Orchestration** — a central **Saga orchestrator** tells each service what to do next and triggers compensations on failure. Easier to understand and debug, but the orchestrator is one more component to build and maintain.
+There are two ways to coordinate the steps, both described on [microservices.io's Saga pattern page](https://microservices.io/patterns/data/saga.html). Take a "Create Order" saga that must check the customer's credit before approving the order.
 
-<Callout type="warning">
-**The price: eventual consistency.** Because each service commits immediately, there are moments when the system is temporarily inconsistent — payment charged, stock not yet reserved. It becomes consistent *eventually*, once the whole Saga finishes (or all compensations run). See [eventual consistency](/questions/eventual-consistency-explained).
+**1. Choreography — no central coordinator.** Each service listens for events published by others and decides for itself what to do next.
+
+```mermaid
+flowchart LR
+  Client(("Client")) -->|"① POST /orders"| OAgg
+
+  subgraph OS["Order Service"]
+    direction TB
+    OAgg[["«aggregate»<br/>Order"]]
+  end
+
+  OAgg -->|"② event: Order Created"| OrderCh[("Order events<br/>channel")]
+  OrderCh -->|"POST /customer"| CAgg
+
+  subgraph CS["Customer Service"]
+    direction TB
+    CAgg[["«aggregate»<br/>Customer"]]
+  end
+
+  CAgg -->|"③ event: Credit Reserved"| CustCh[("Customer events<br/>channel")]
+  CAgg -->|"④ event: Credit Limit Exceeded"| CustCh
+  CustCh -->|"⑤ approve / reject order"| OAgg
+```
+
+The Order Service creates the order and publishes `OrderCreated` onto its **events channel**. The Customer Service subscribes to that channel, tries to reserve credit against its own `Customer` aggregate, then publishes back either `CreditReserved` or `CreditLimitExceeded` onto *its* events channel. The Order Service subscribes to that and approves or rejects the order accordingly. Nobody is "in charge" — every service just reacts to events flowing through the channels. Simple for a short flow, but with many services it gets hard to see the overall flow just by reading the code, since it's scattered across every participant.
+
+**2. Orchestration — a central saga orchestrator.** One object owns the whole flow, sends explicit commands to each service through a message broker, and interprets the replies.
+
+```mermaid
+flowchart LR
+  Client(("Client")) -->|"POST /orders"| OCtrl
+
+  subgraph OS["Order Service"]
+    direction TB
+    OCtrl["Order Controller"] --> OSvc["Order Service"]
+    OSvc -->|"① create()"| Saga["Create Order Saga"]
+    Saga -->|"② create()"| OAgg[["«aggregate»<br/>Order"]]
+    Saga -->|"⑥ approve()"| OAgg
+  end
+
+  Saga -->|"③ Reserve Credit<br/>command"| CmdCh
+
+  subgraph Broker["Message Broker"]
+    direction TB
+    CmdCh[("Customer Service<br/>command channel")]
+    ReplyCh[("Create Order Saga<br/>reply channel")]
+  end
+
+  CmdCh -->|"command handler"| CSvc
+
+  subgraph CS["Customer Service"]
+    direction TB
+    CSvc["Customer Service"] -->|"④ reserve()"| CAgg[["«aggregate»<br/>Customer"]]
+  end
+
+  CSvc -->|"⑤ Reserve Credit<br/>response"| ReplyCh
+  ReplyCh -->|"reply"| Saga
+```
+
+The Order Controller creates an orchestrator (`CreateOrderSaga`) for this specific order. The orchestrator creates the `Order` aggregate in PENDING state, then sends a `Reserve Credit` command through the message broker's command channel. The Customer Service's command handler picks it up, calls `reserve()` on the `Customer` aggregate, and sends the response back through a reply channel. The orchestrator reads the reply and calls `approve()` (or a compensating "reject") on the `Order` aggregate. This is easier to understand and debug — the whole saga logic lives in one place — but the orchestrator and its message channels are more components to design and run.
+
+<Callout type="info">
+**Choreography vs. orchestration, in one line:** choreography is "everyone reacts to events they hear"; orchestration is "one conductor tells everyone what to do." Small sagas (2-3 steps) often use choreography; longer or business-critical sagas usually move to orchestration so the flow stays visible and easy to change.
 </Callout>
 
-Compensations must be **idempotent** — a retried refund must not refund twice. See [idempotency](/concepts/idempotency).
+<Callout type="warning">
+**The price: eventual consistency.** Because each service commits immediately, there are moments when the system is temporarily inconsistent — payment charged, stock not yet reserved. It becomes consistent *eventually*, once the whole saga finishes (or all compensations run). See [eventual consistency](/questions/eventual-consistency-explained).
+</Callout>
+
+Three extra things worth knowing (also called out on the microservices.io page):
+
+- **Update the database and publish the event as one atomic step.** A service must not commit its local transaction and then separately publish the event — if it crashes in between, the event is lost forever and the saga stalls. This is usually solved with the [Transactional Outbox pattern](/concepts/idempotency) or event sourcing.
+- **Sagas lack isolation.** Because every local transaction commits right away, other requests can read "dirty" intermediate state before the saga finishes (e.g., see the order as PENDING). This is different from ACID's Isolation guarantee and is one of the trade-offs teams accept for scalability.
+- **There's no automatic rollback.** A normal ACID transaction rolls itself back for free. In a saga, *you* write the undo logic — every step that can fail needs an explicit compensating transaction designed for it up front.
+
+**How does the client find out the result?** The client calls a normal synchronous endpoint (`POST /orders`), but the saga behind it runs asynchronously over several services — so what does that endpoint return? Three common options: (a) hold the response open and reply only once the whole saga finishes; (b) reply immediately with an ID (`orderId`) and let the client poll `GET /orders/{orderId}` for status; or (c) reply immediately and push the final result later over a websocket or webhook. Most systems pick (b) — it's simple and fits a stateless HTTP request/response cycle.
+
+Compensations must also be **idempotent** — a retried refund must not refund twice. See [idempotency](/concepts/idempotency).
 
 ## Comparison
 
